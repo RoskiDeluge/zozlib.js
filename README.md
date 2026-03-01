@@ -25,3 +25,11 @@ $ <browser> http://localhost:6969/
 $ clang -o nob nob.c
 $ ./nob
 ```
+
+If your default `clang` does not support WebAssembly, set `CC` to a wasm-enabled clang:
+
+```console
+$ CC=/opt/homebrew/opt/llvm/bin/clang ./nob
+```
+
+`nob` also auto-detects `/opt/homebrew/opt/llvm/bin/clang` and uses it when available.

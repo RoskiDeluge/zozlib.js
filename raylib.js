@@ -33,6 +33,7 @@ class RaylibJs {
 
     #reset() {
         this.previous = undefined;
+        this.startTime = undefined;
         this.wasm = undefined;
         this.ctx = undefined;
         this.dt = undefined;
@@ -44,6 +45,9 @@ class RaylibJs {
         this.currentMousePosition = {x: 0, y: 0};
         this.images = [];
         this.quit = false;
+        this.mode2dDepth = 0;
+        this.heapPtr = 0;
+        this.heapInitialized = false;
     }
 
     constructor() {
@@ -69,6 +73,7 @@ class RaylibJs {
         this.wasm = await WebAssembly.instantiateStreaming(fetch(wasmPath), {
             env: make_environment(this)
         });
+        this.startTime = performance.now();
 
         const keyDown = (e) => {
             this.currentPressedKeyState.add(glfwKeyMapping[e.code]);
@@ -112,6 +117,9 @@ class RaylibJs {
         const buffer = this.wasm.instance.exports.memory.buffer;
         document.title = cstr_by_ptr(buffer, title_ptr);
     }
+    SetConfigFlags() {}
+    SetExitKey() {}
+    SetWindowIcon() {}
 
     WindowShouldClose(){
         return false;
@@ -136,12 +144,35 @@ class RaylibJs {
         return Math.min(this.dt, 1.0/this.targetFPS);
     }
 
+    GetTime() {
+        if (this.startTime === undefined) return 0.0;
+        return (performance.now() - this.startTime)/1000.0;
+    }
+
     BeginDrawing() {}
 
     EndDrawing() {
         this.prevPressedKeyState.clear();
         this.prevPressedKeyState = new Set(this.currentPressedKeyState);
         this.currentMouseWheelMoveState = 0.0;
+    }
+
+    BeginMode2D(camera_ptr) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [offsetX, offsetY, targetX, targetY, rotation, zoom] = new Float32Array(buffer, camera_ptr, 6);
+        this.ctx.save();
+        this.ctx.translate(offsetX, offsetY);
+        this.ctx.rotate(rotation*Math.PI/180.0);
+        this.ctx.scale(zoom, zoom);
+        this.ctx.translate(-targetX, -targetY);
+        this.mode2dDepth += 1;
+    }
+
+    EndMode2D() {
+        if (this.mode2dDepth > 0) {
+            this.ctx.restore();
+            this.mode2dDepth -= 1;
+        }
     }
 
     DrawCircleV(center_ptr, radius, color_ptr) {
@@ -193,6 +224,26 @@ class RaylibJs {
         this.ctx.fillRect(position[0], position[1], size[0], size[1]);
     }
 
+    DrawTriangleStrip(points_ptr, pointCount, color_ptr) {
+        if (pointCount < 3) return;
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const points = new Float32Array(buffer, points_ptr, pointCount*2);
+        const color = getColorFromMemory(buffer, color_ptr);
+        this.ctx.fillStyle = color;
+
+        for (let i = 2; i < pointCount; i++) {
+            const a = (i - 2)*2;
+            const b = (i - 1)*2;
+            const c = i*2;
+            this.ctx.beginPath();
+            this.ctx.moveTo(points[a + 0], points[a + 1]);
+            this.ctx.lineTo(points[b + 0], points[b + 1]);
+            this.ctx.lineTo(points[c + 0], points[c + 1]);
+            this.ctx.closePath();
+            this.ctx.fill();
+        }
+    }
+
     IsKeyPressed(key) {
         return !this.prevPressedKeyState.has(key) && this.currentPressedKeyState.has(key);
     }
@@ -209,6 +260,73 @@ class RaylibJs {
     TextFormat(... args){ 
         // TODO: Implement printf style formatting for TextFormat
         return args[0];
+    }
+
+    #initHeap() {
+        if (this.heapInitialized) return;
+        const heapBaseExport = this.wasm.instance.exports.__heap_base;
+        if (heapBaseExport !== undefined) {
+            const heapBase = (typeof heapBaseExport === "number") ? heapBaseExport : heapBaseExport.value;
+            this.heapPtr = (heapBase + 7) & ~7;
+        } else {
+            // Some builds don't export __heap_base. Allocate from the end
+            // of currently available memory and grow as needed.
+            const memEnd = this.wasm.instance.exports.memory.buffer.byteLength;
+            this.heapPtr = (memEnd + 7) & ~7;
+        }
+        this.heapInitialized = true;
+    }
+
+    MemAlloc(size) {
+        this.#initHeap();
+        let ptr = this.heapPtr;
+        this.heapPtr = (this.heapPtr + size + 7) & ~7;
+
+        const memory = this.wasm.instance.exports.memory;
+        if (this.heapPtr > memory.buffer.byteLength) {
+            const required = this.heapPtr - memory.buffer.byteLength;
+            const pages = Math.ceil(required/65536);
+            memory.grow(pages);
+        }
+
+        return ptr;
+    }
+
+    MemFree() {
+        // Minimal allocator for demos: free is a no-op.
+    }
+
+    memset(dst_ptr, value, count) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const mem = new Uint8Array(buffer);
+        mem.fill(value & 0xFF, dst_ptr, dst_ptr + count);
+        return dst_ptr;
+    }
+
+    memcpy(dst_ptr, src_ptr, count) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const mem = new Uint8Array(buffer);
+        mem.copyWithin(dst_ptr, src_ptr, src_ptr + count);
+        return dst_ptr;
+    }
+
+    memmove(dst_ptr, src_ptr, count) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const mem = new Uint8Array(buffer);
+        mem.copyWithin(dst_ptr, src_ptr, src_ptr + count);
+        return dst_ptr;
+    }
+
+    TextCopy(dst_ptr, src_ptr) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const mem = new Uint8Array(buffer);
+        let i = 0;
+        while (mem[src_ptr + i] !== 0) {
+            mem[dst_ptr + i] = mem[src_ptr + i];
+            i += 1;
+        }
+        mem[dst_ptr + i] = 0;
+        return i;
     }
 
     TraceLog(logLevel, text_ptr, ... args) {
@@ -387,6 +505,65 @@ class RaylibJs {
 
         result[3] = 255;
     }
+
+    Vector2Scale(result_ptr, v_ptr, scale) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [x, y] = new Float32Array(buffer, v_ptr, 2);
+        new Float32Array(buffer, result_ptr, 2).set([x*scale, y*scale]);
+    }
+
+    Vector2Add(result_ptr, a_ptr, b_ptr) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [ax, ay] = new Float32Array(buffer, a_ptr, 2);
+        const [bx, by] = new Float32Array(buffer, b_ptr, 2);
+        new Float32Array(buffer, result_ptr, 2).set([ax + bx, ay + by]);
+    }
+
+    Vector2Subtract(result_ptr, a_ptr, b_ptr) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [ax, ay] = new Float32Array(buffer, a_ptr, 2);
+        const [bx, by] = new Float32Array(buffer, b_ptr, 2);
+        new Float32Array(buffer, result_ptr, 2).set([ax - bx, ay - by]);
+    }
+
+    Vector2Multiply(result_ptr, a_ptr, b_ptr) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [ax, ay] = new Float32Array(buffer, a_ptr, 2);
+        const [bx, by] = new Float32Array(buffer, b_ptr, 2);
+        new Float32Array(buffer, result_ptr, 2).set([ax * bx, ay * by]);
+    }
+
+    Vector2Rotate(result_ptr, v_ptr, angle) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [x, y] = new Float32Array(buffer, v_ptr, 2);
+        const c = Math.cos(angle);
+        const s = Math.sin(angle);
+        new Float32Array(buffer, result_ptr, 2).set([x*c - y*s, x*s + y*c]);
+    }
+
+    Vector2Lerp(result_ptr, a_ptr, b_ptr, amount) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [ax, ay] = new Float32Array(buffer, a_ptr, 2);
+        const [bx, by] = new Float32Array(buffer, b_ptr, 2);
+        new Float32Array(buffer, result_ptr, 2).set([
+            ax + (bx - ax)*amount,
+            ay + (by - ay)*amount,
+        ]);
+    }
+
+    Vector2LineAngle(start_ptr, end_ptr) {
+        const buffer = this.wasm.instance.exports.memory.buffer;
+        const [sx, sy] = new Float32Array(buffer, start_ptr, 2);
+        const [ex, ey] = new Float32Array(buffer, end_ptr, 2);
+        return Math.atan2(ey - sy, ex - sx);
+    }
+
+    fmaxf(a, b) { return Math.max(a, b); }
+    fminf(a, b) { return Math.min(a, b); }
+    floorf(a) { return Math.floor(a); }
+    atan2f(y, x) { return Math.atan2(y, x); }
+    sinf(a) { return Math.sin(a); }
+    cosf(a) { return Math.cos(a); }
 
     raylib_js_set_entry(entry) {
         this.entryFunction = this.wasm.instance.exports.__indirect_function_table.get(entry);
