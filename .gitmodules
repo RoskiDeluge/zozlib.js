@@ -1,0 +1,6 @@
+[submodule "pinekin3"]
+	path = pinekin3
+	url = git@github.com:RoskiDeluge/pinekin3.git
+[submodule "raylib"]
+	path = raylib
+	url = https://github.com/raysan5/raylib.git
